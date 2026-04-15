@@ -1,0 +1,13 @@
+pandas
+faker
+# Spark 4.x ships Hadoop 3.4.x; Windows hadoop.dll from cdarlint is 3.3.x — JNI mismatch breaks Delta.
+# Pin Spark 3.5 + Delta 3.2 so native winutils/hadoop.dll (3.3.6) aligns with the bundled Hadoop client.
+pyspark==3.5.4
+delta-spark==3.2.0
+fastapi
+uvicorn
+langgraph
+langchain-ollama
+pydantic
+python-dotenv
+langchain-openai
