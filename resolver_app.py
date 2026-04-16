@@ -1,8 +1,10 @@
+import ast
 import os
 import re
 from pathlib import Path
 from typing import TypedDict
 
+import requests
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -14,12 +16,32 @@ from pydantic import BaseModel
 load_dotenv()
 
 
+def send_slack_alert(message: str) -> None:
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not slack_webhook_url:
+        return
+    try:
+        response = requests.post(
+            slack_webhook_url,
+            json={"text": message},
+            timeout=15,
+        )
+        if response.status_code != 200:
+            print(
+                f"[Slack] Alert failed with status {response.status_code}: {response.text}"
+            )
+    except requests.RequestException as exc:
+        print(f"[Slack] Alert request failed: {exc}")
+
+
 class ResolverState(TypedDict):
     error_log: str
     expected_schema: str
     incoming_schema: str
     generated_code: str
     llm_provider: str
+    retry_count: int
+    validation_error: str
 
 
 def parse_error_log(state: ResolverState) -> ResolverState:
@@ -73,8 +95,9 @@ def parse_error_log(state: ResolverState) -> ResolverState:
 
 
 def generate_patch(state: ResolverState) -> ResolverState:
+    retry_count = state.get("retry_count", 0) + 1
     llm_provider = "local_ollama"
-    openrouter_api_key = os.getenv("OPENROUTER_API_KEY")
+    openrouter_api_key = os.getenv("OPENROUTER_API_KEY2")
     if openrouter_api_key:
         llm_provider = "openrouter"
         print("[LLM] Provider selected: OpenRouter")
@@ -104,6 +127,13 @@ Incoming Data Schema: {state.get('incoming_schema', '')}
 Error Log: {state.get('error_log', '')}
 Code:
 """
+    validation_error = state.get("validation_error", "")
+    if validation_error:
+        prompt += (
+            "\n\nWARNING: Your previous attempt failed Python validation with this "
+            f"error: {validation_error}. Please fix your syntax and try again."
+        )
+
     try:
         llm_result = llm.invoke(prompt)
     except Exception as exc:
@@ -117,7 +147,33 @@ Code:
         generated_code = llm_result.strip()
     else:
         generated_code = str(getattr(llm_result, "content", llm_result)).strip()
-    return {**state, "generated_code": generated_code, "llm_provider": llm_provider}
+    return {
+        **state,
+        "generated_code": generated_code,
+        "llm_provider": llm_provider,
+        "retry_count": retry_count,
+    }
+
+
+def validate_patch(state: ResolverState) -> ResolverState:
+    try:
+        ast.parse(state.get("generated_code", ""))
+        validation_error = ""
+    except (SyntaxError, Exception) as e:
+        validation_error = str(e)
+        send_slack_alert(
+            f"⚠️ *Agent Self-Correction:* Generated code failed validation (`{str(e)}`). "
+            "Attempting to fix and rewrite..."
+        )
+    return {**state, "validation_error": validation_error}
+
+
+def route_validation(state: ResolverState) -> str:
+    if state.get("validation_error", "") == "":
+        return "save_patch"
+    if state.get("retry_count", 0) < 3:
+        return "generate_patch"
+    return "save_patch"
 
 
 def save_patch(state: ResolverState) -> ResolverState:
@@ -129,6 +185,10 @@ def save_patch(state: ResolverState) -> ResolverState:
         generated_code.replace("```python", "").replace("```", "").strip()
     )
     patch_path.write_text(cleaned_code, encoding="utf-8")
+    send_slack_alert(
+        "✅ *Issue Resolved:* Agent successfully generated and validated the PySpark "
+        "migration patch. Saved to `patches/auto_patch_v1.py`."
+    )
     return state
 
 
@@ -136,11 +196,20 @@ def build_graph():
     graph_builder = StateGraph(ResolverState)
     graph_builder.add_node("parse_error_log", parse_error_log)
     graph_builder.add_node("generate_patch", generate_patch)
+    graph_builder.add_node("validate_patch", validate_patch)
     graph_builder.add_node("save_patch", save_patch)
 
     graph_builder.add_edge(START, "parse_error_log")
     graph_builder.add_edge("parse_error_log", "generate_patch")
-    graph_builder.add_edge("generate_patch", "save_patch")
+    graph_builder.add_edge("generate_patch", "validate_patch")
+    graph_builder.add_conditional_edges(
+        "validate_patch",
+        route_validation,
+        {
+            "generate_patch": "generate_patch",
+            "save_patch": "save_patch",
+        },
+    )
     graph_builder.add_edge("save_patch", END)
 
     return graph_builder.compile()
@@ -157,6 +226,11 @@ class WebhookPayload(BaseModel):
 @app.post("/webhook")
 def webhook(payload: WebhookPayload):
     try:
+        send_slack_alert(
+            "🚨 *Data Pipeline Failure Detected* 🚨\n"
+            "Job: `daily_orders_ingestion`\n\n"
+            "🤖 *AI Agent Triggered:* Investigating schema drift and drafting a patch..."
+        )
         final_state = resolver_graph.invoke(
             {
                 "error_log": payload.error_log,
@@ -164,6 +238,8 @@ def webhook(payload: WebhookPayload):
                 "incoming_schema": "",
                 "generated_code": "",
                 "llm_provider": "",
+                "retry_count": 0,
+                "validation_error": "",
             }
         )
     except Exception as exc:

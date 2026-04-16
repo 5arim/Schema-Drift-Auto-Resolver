@@ -57,10 +57,10 @@ def run_orchestration() -> None:
             print(exc)
             return
 
-        print("\n🚨📣 SIMULATED SLACK ALERT 📣🚨")
+        print("\n✅ Webhook sent to AI resolver.")
         print("Pipeline Failure Detected on Day 2 (Schema Drift).")
         print("🤖 AI Auto-Resolver was triggered via /webhook.")
-        print("✅ Generated patch saved to: patches/auto_patch_v1.py")
+        print("📄 Patch path reported by resolver: patches/auto_patch_v1.py")
     else:
         print("\nDay 2 unexpectedly succeeded. No schema drift detected.")
 
